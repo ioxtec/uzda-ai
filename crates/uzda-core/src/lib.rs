@@ -1,3 +1,13 @@
+mod agent;
+mod error;
+mod event;
+mod session;
+
+pub use agent::{AgentCapabilities, AgentDescriptor, AgentKind, AgentRuntime, RuntimeAvailability};
+pub use error::UzdaError;
+pub use event::AgentEvent;
+pub use session::{AgentSession, SessionId};
+
 pub fn welcome_message() -> &'static str {
     "Welcome to Uzda!"
 }

@@ -9,5 +9,7 @@ name = "uzda"
 path = "src/main.rs"
 
 [dependencies]
+uzda-agent-claude = { path = "../uzda-agent-claude" }
+uzda-agent-codex = { path = "../uzda-agent-codex" }
 uzda-core = { path = "../uzda-core" }
 

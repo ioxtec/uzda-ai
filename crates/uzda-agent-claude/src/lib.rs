@@ -1,0 +1,79 @@
+use std::io::ErrorKind;
+use std::process::Command;
+
+use uzda_core::{AgentCapabilities, AgentDescriptor, AgentKind, AgentRuntime, RuntimeAvailability};
+
+#[derive(Debug, Clone)]
+pub struct ClaudeAgent {
+    command: String,
+}
+
+impl ClaudeAgent {
+    pub fn new(command: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+        }
+    }
+}
+
+impl Default for ClaudeAgent {
+    fn default() -> Self {
+        Self::new("claude")
+    }
+}
+
+impl AgentRuntime for ClaudeAgent {
+    fn descriptor(&self) -> AgentDescriptor {
+        AgentDescriptor {
+            kind: AgentKind::Claude,
+            display_name: "Claude Code",
+            capabilities: AgentCapabilities::coding_agent(),
+        }
+    }
+
+    fn availability(&self) -> RuntimeAvailability {
+        detect_version(&self.command)
+    }
+}
+
+fn detect_version(command: &str) -> RuntimeAvailability {
+    // This check stays deliberately small; authentication belongs to Claude itself for now.
+    match Command::new(command).arg("--version").output() {
+        Ok(output) if output.status.success() => RuntimeAvailability::Available {
+            version: output_text(&output.stdout),
+        },
+        Ok(output) => RuntimeAvailability::Unavailable {
+            reason: output_text(&output.stderr)
+                .unwrap_or_else(|| format!("process exited with {}", output.status)),
+        },
+        Err(error) if error.kind() == ErrorKind::NotFound => RuntimeAvailability::NotFound,
+        Err(error) => RuntimeAvailability::Unavailable {
+            reason: error.to_string(),
+        },
+    }
+}
+
+fn output_text(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes).trim().to_owned();
+    (!text.is_empty()).then_some(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn describes_claude_runtime() {
+        let descriptor = ClaudeAgent::default().descriptor();
+
+        assert_eq!(descriptor.kind, AgentKind::Claude);
+        assert_eq!(descriptor.display_name, "Claude Code");
+    }
+
+    #[test]
+    fn reports_missing_command() {
+        let agent = ClaudeAgent::new("uzda-test-command-that-does-not-exist");
+
+        assert_eq!(agent.availability(), RuntimeAvailability::NotFound);
+    }
+}

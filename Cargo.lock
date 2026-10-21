@@ -3,9 +3,25 @@
 version = 4
 
 [[package]]
+name = "uzda-agent-claude"
+version = "0.1.0"
+dependencies = [
+ "uzda-core",
+]
+
+[[package]]
+name = "uzda-agent-codex"
+version = "0.1.0"
+dependencies = [
+ "uzda-core",
+]
+
+[[package]]
 name = "uzda-cli"
 version = "0.1.0"
 dependencies = [
+ "uzda-agent-claude",
+ "uzda-agent-codex",
  "uzda-core",
 ]
 

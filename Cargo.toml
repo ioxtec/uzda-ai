@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "crates/uzda-core",
+    "crates/uzda-agent-codex",
+    "crates/uzda-agent-claude",
     "crates/uzda-cli",
 ]
 resolver = "3"
