@@ -1,7 +1,11 @@
+mod app_server;
+
 use std::io::ErrorKind;
 use std::process::Command;
 
 use uzda_core::{AgentCapabilities, AgentDescriptor, AgentKind, AgentRuntime, RuntimeAvailability};
+
+pub use app_server::{CodexAppServer, CodexClientInfo, CodexError, CodexServerInfo};
 
 #[derive(Debug, Clone)]
 pub struct CodexAgent {
@@ -13,6 +17,10 @@ impl CodexAgent {
         Self {
             command: command.into(),
         }
+    }
+
+    pub fn connect(&self) -> Result<CodexAppServer, CodexError> {
+        CodexAppServer::start(&self.command, CodexClientInfo::default())
     }
 }
 

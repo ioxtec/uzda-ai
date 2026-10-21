@@ -23,6 +23,12 @@ List the agent runtimes available on your machine:
 cargo run -p uzda-cli -- agents
 ```
 
+Test the first real Codex app-server handshake:
+
+```sh
+cargo run -p uzda-cli -- codex status
+```
+
 ## Check
 
 ```sh
