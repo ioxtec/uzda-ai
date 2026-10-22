@@ -1,3 +1,9 @@
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    Approve,
+    Decline,
+}
+
 // Adapters translate their native messages into this small, predictable stream.
 // That way every future UI can focus on presenting events instead of decoding them.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -6,7 +6,8 @@ use std::process::ExitCode;
 use uzda_agent_claude::ClaudeAgent;
 use uzda_agent_codex::{CodexAgent, CodexAppServer, CodexError, CodexThreadOptions};
 use uzda_core::{
-    AgentEvent, AgentKind, AgentRuntime, AgentSession, LocalSessionStore, RuntimeAvailability,
+    AgentEvent, AgentKind, AgentRuntime, AgentSession, ApprovalDecision, LocalSessionStore,
+    RuntimeAvailability,
 };
 
 type CliResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -126,14 +127,27 @@ fn ask_codex(prompt: &str) -> CliResult {
     let store = LocalSessionStore::for_project(&project_directory);
     let session = open_codex_session(&mut server, &store, &project_directory)?;
 
-    server.run_turn(&session, prompt, |event| match event {
-        AgentEvent::TextDelta(text) => {
-            print!("{text}");
-            let _ = io::stdout().flush();
-        }
-        AgentEvent::TurnCompleted => println!(),
-        _ => {}
-    })?;
+    server.run_turn(
+        &session,
+        prompt,
+        |event| match event {
+            AgentEvent::TextDelta(text) => {
+                print!("{text}");
+                let _ = io::stdout().flush();
+            }
+            AgentEvent::ToolStarted { name } => eprintln!("[tool started] {name}"),
+            AgentEvent::ToolCompleted { name, succeeded } => {
+                let status = if succeeded { "completed" } else { "failed" };
+                eprintln!("[tool {status}] {name}");
+            }
+            AgentEvent::ApprovalRequired { description } => {
+                eprintln!("\nApproval required:\n{description}");
+            }
+            AgentEvent::TurnCompleted => println!(),
+            AgentEvent::TurnFailed { .. } => {}
+        },
+        ask_for_approval,
+    )?;
 
     Ok(())
 }
@@ -151,6 +165,19 @@ fn open_codex_session(
     store.save(&session)?;
 
     Ok(session)
+}
+
+fn ask_for_approval(_description: &str) -> ApprovalDecision {
+    eprint!("Approve once? [y/N] ");
+    let _ = io::stderr().flush();
+
+    let mut answer = String::new();
+    match io::stdin().read_line(&mut answer) {
+        Ok(_) if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") => {
+            ApprovalDecision::Approve
+        }
+        _ => ApprovalDecision::Decline,
+    }
 }
 
 fn format_availability(availability: RuntimeAvailability) -> String {

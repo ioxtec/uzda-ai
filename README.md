@@ -43,6 +43,8 @@ cargo run -p uzda-cli -- codex ask "Explain ownership in one sentence"
 
 Uzda stores only local session identifiers in `.uzda/sessions.json`. Credentials remain managed by the installed agent runtime and are never copied into the project.
 
+Tool activity is printed while a turn is running. If Codex asks for permission to run a command or change files, the CLI requires an explicit `y` or `yes`; pressing Enter declines the request.
+
 ## Check
 
 ```sh

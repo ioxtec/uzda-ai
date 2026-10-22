@@ -8,7 +8,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use uzda_core::{AgentEvent, AgentKind, AgentSession, SessionId};
+use uzda_core::{AgentEvent, AgentKind, AgentSession, ApprovalDecision, SessionId};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -223,6 +223,7 @@ impl CodexAppServer {
         session: &AgentSession,
         prompt: &str,
         mut on_event: impl FnMut(AgentEvent),
+        mut on_approval: impl FnMut(&str) -> ApprovalDecision,
     ) -> Result<(), CodexError> {
         if session.agent != AgentKind::Codex {
             return Err(CodexError::WrongAgent(session.agent));
@@ -249,8 +250,14 @@ impl CodexAppServer {
             let message = self.next_message()?;
 
             if message.get("id").is_some() && message.get("method").is_some() {
-                let method = message["method"].as_str().unwrap_or("unknown").to_owned();
-                return Err(CodexError::UnsupportedServerRequest(method));
+                self.handle_server_request(
+                    message,
+                    session.id.as_str(),
+                    &turn_id,
+                    &mut on_event,
+                    &mut on_approval,
+                )?;
+                continue;
             }
 
             match message.get("method").and_then(Value::as_str) {
@@ -259,6 +266,17 @@ impl CodexAppServer {
 
                     if event.matches(session.id.as_str(), &turn_id) {
                         on_event(AgentEvent::TextDelta(event.delta));
+                    }
+                }
+                Some("item/started") => {
+                    if let Some(event) = tool_event(message, session.id.as_str(), &turn_id, true)? {
+                        on_event(event);
+                    }
+                }
+                Some("item/completed") => {
+                    if let Some(event) = tool_event(message, session.id.as_str(), &turn_id, false)?
+                    {
+                        on_event(event);
                     }
                 }
                 Some("error") => {
@@ -294,6 +312,39 @@ impl CodexAppServer {
                 _ => {}
             }
         }
+    }
+
+    fn handle_server_request(
+        &mut self,
+        message: Value,
+        thread_id: &str,
+        turn_id: &str,
+        on_event: &mut impl FnMut(AgentEvent),
+        on_approval: &mut impl FnMut(&str) -> ApprovalDecision,
+    ) -> Result<(), CodexError> {
+        let method = message["method"].as_str().unwrap_or("unknown").to_owned();
+
+        if !matches!(
+            method.as_str(),
+            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval"
+        ) {
+            return Err(CodexError::UnsupportedServerRequest(method));
+        }
+
+        let request_id = message["id"].clone();
+        let params: ApprovalRequest = parse_params(message)?;
+
+        if !params.matches(thread_id, turn_id) {
+            write_approval_response(&mut self.stdin, request_id, ApprovalDecision::Decline)?;
+            return Ok(());
+        }
+
+        let description = params.description(&method);
+        on_event(AgentEvent::ApprovalRequired {
+            description: description.clone(),
+        });
+        let decision = on_approval(&description);
+        write_approval_response(&mut self.stdin, request_id, decision)
     }
 
     fn initialize(&mut self, client_info: CodexClientInfo) -> Result<(), CodexError> {
@@ -367,6 +418,57 @@ struct AgentMessageDelta {
     delta: String,
     thread_id: String,
     turn_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ItemNotification {
+    item: Value,
+    thread_id: String,
+    turn_id: String,
+}
+
+impl ItemNotification {
+    fn matches(&self, thread_id: &str, turn_id: &str) -> bool {
+        self.thread_id == thread_id && self.turn_id == turn_id
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApprovalRequest {
+    thread_id: String,
+    turn_id: String,
+    command: Option<String>,
+    reason: Option<String>,
+    grant_root: Option<String>,
+}
+
+impl ApprovalRequest {
+    fn matches(&self, thread_id: &str, turn_id: &str) -> bool {
+        self.thread_id == thread_id && self.turn_id == turn_id
+    }
+
+    fn description(&self, method: &str) -> String {
+        let action = match method {
+            "item/commandExecution/requestApproval" => self
+                .command
+                .as_deref()
+                .map(|command| format!("Run command: {command}"))
+                .unwrap_or_else(|| "Run a command".to_owned()),
+            "item/fileChange/requestApproval" => self
+                .grant_root
+                .as_deref()
+                .map(|root| format!("Allow file changes in: {root}"))
+                .unwrap_or_else(|| "Apply file changes".to_owned()),
+            _ => "Perform an action".to_owned(),
+        };
+
+        match self.reason.as_deref() {
+            Some(reason) if !reason.trim().is_empty() => format!("{action}\nReason: {reason}"),
+            _ => action,
+        }
+    }
 }
 
 impl AgentMessageDelta {
@@ -466,6 +568,69 @@ fn parse_params<T: DeserializeOwned>(message: Value) -> Result<T, CodexError> {
         .ok_or_else(|| CodexError::Protocol("notification has no params".to_owned()))?;
 
     serde_json::from_value(params).map_err(CodexError::from)
+}
+
+fn tool_event(
+    message: Value,
+    thread_id: &str,
+    turn_id: &str,
+    started: bool,
+) -> Result<Option<AgentEvent>, CodexError> {
+    let notification: ItemNotification = parse_params(message)?;
+
+    if !notification.matches(thread_id, turn_id) {
+        return Ok(None);
+    }
+
+    let Some(name) = tool_name(&notification.item) else {
+        return Ok(None);
+    };
+
+    if started {
+        return Ok(Some(AgentEvent::ToolStarted { name }));
+    }
+
+    let succeeded =
+        notification.item["status"] == "completed" || notification.item["success"] == true;
+
+    Ok(Some(AgentEvent::ToolCompleted { name, succeeded }))
+}
+
+fn tool_name(item: &Value) -> Option<String> {
+    match item.get("type")?.as_str()? {
+        "commandExecution" => item["command"].as_str().map(ToOwned::to_owned),
+        "fileChange" => Some("file changes".to_owned()),
+        "mcpToolCall" => Some(format!(
+            "{}/{}",
+            item["server"].as_str()?,
+            item["tool"].as_str()?
+        )),
+        "dynamicToolCall" => item["tool"].as_str().map(ToOwned::to_owned),
+        "collabAgentToolCall" => item["tool"].as_str().map(ToOwned::to_owned),
+        "webSearch" => Some("web search".to_owned()),
+        "imageView" => Some("image view".to_owned()),
+        "imageGeneration" => Some("image generation".to_owned()),
+        _ => None,
+    }
+}
+
+fn write_approval_response(
+    writer: &mut impl Write,
+    request_id: Value,
+    decision: ApprovalDecision,
+) -> Result<(), CodexError> {
+    let decision = match decision {
+        ApprovalDecision::Approve => "accept",
+        ApprovalDecision::Decline => "decline",
+    };
+
+    write_message(
+        writer,
+        &json!({
+            "id": request_id,
+            "result": { "decision": decision }
+        }),
+    )
 }
 
 fn server_error(error: &Value) -> CodexError {
@@ -609,5 +774,65 @@ mod tests {
 
         assert_eq!(event.turn.status, "completed");
         assert!(event.matches("thread-1", "turn-1"));
+    }
+
+    #[test]
+    fn maps_command_lifecycle_to_agent_events() {
+        let started = json!({
+            "method": "item/started",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "startedAtMs": 1,
+                "item": {
+                    "id": "item-1",
+                    "type": "commandExecution",
+                    "command": "cargo check",
+                    "commandActions": [],
+                    "cwd": "/tmp",
+                    "status": "inProgress"
+                }
+            }
+        });
+        let completed = json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "startedAtMs": 1,
+                "item": {
+                    "id": "item-1",
+                    "type": "commandExecution",
+                    "command": "cargo check",
+                    "commandActions": [],
+                    "cwd": "/tmp",
+                    "status": "completed"
+                }
+            }
+        });
+
+        assert_eq!(
+            tool_event(started, "thread-1", "turn-1", true).unwrap(),
+            Some(AgentEvent::ToolStarted {
+                name: "cargo check".to_owned()
+            })
+        );
+        assert_eq!(
+            tool_event(completed, "thread-1", "turn-1", false).unwrap(),
+            Some(AgentEvent::ToolCompleted {
+                name: "cargo check".to_owned(),
+                succeeded: true
+            })
+        );
+    }
+
+    #[test]
+    fn writes_a_narrow_approval_decision() {
+        let mut output = Vec::new();
+
+        write_approval_response(&mut output, json!(7), ApprovalDecision::Approve)
+            .expect("the response should be written");
+
+        assert_eq!(output, b"{\"id\":7,\"result\":{\"decision\":\"accept\"}}\n");
     }
 }
