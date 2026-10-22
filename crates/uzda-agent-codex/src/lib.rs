@@ -5,7 +5,9 @@ use std::process::Command;
 
 use uzda_core::{AgentCapabilities, AgentDescriptor, AgentKind, AgentRuntime, RuntimeAvailability};
 
-pub use app_server::{CodexAppServer, CodexClientInfo, CodexError, CodexServerInfo};
+pub use app_server::{
+    CodexAppServer, CodexClientInfo, CodexError, CodexServerInfo, CodexThreadOptions,
+};
 
 #[derive(Debug, Clone)]
 pub struct CodexAgent {

@@ -29,6 +29,12 @@ Test the first real Codex app-server handshake:
 cargo run -p uzda-cli -- codex status
 ```
 
+Start a persistent Codex thread for the current directory:
+
+```sh
+cargo run -p uzda-cli -- codex start
+```
+
 ## Check
 
 ```sh

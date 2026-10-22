@@ -1,13 +1,13 @@
 use std::error::Error;
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-
-const INITIALIZE_REQUEST_ID: u64 = 1;
+use uzda_core::{AgentKind, AgentSession, SessionId};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,6 +36,31 @@ pub struct CodexServerInfo {
     pub platform_os: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexThreadOptions {
+    pub cwd: PathBuf,
+    pub model: Option<String>,
+    pub ephemeral: bool,
+}
+
+impl CodexThreadOptions {
+    pub fn new(cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            cwd: cwd.into(),
+            model: None,
+            ephemeral: false,
+        }
+    }
+
+    fn validate(&self) -> Result<(), CodexError> {
+        if self.cwd.is_absolute() {
+            Ok(())
+        } else {
+            Err(CodexError::InvalidWorkingDirectory(self.cwd.clone()))
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum CodexError {
     Io(io::Error),
@@ -43,6 +68,7 @@ pub enum CodexError {
     Server { code: i64, message: String },
     Protocol(String),
     ProcessEnded,
+    InvalidWorkingDirectory(PathBuf),
 }
 
 impl fmt::Display for CodexError {
@@ -55,6 +81,13 @@ impl fmt::Display for CodexError {
             }
             Self::Protocol(message) => write!(formatter, "unexpected Codex response: {message}"),
             Self::ProcessEnded => formatter.write_str("Codex app-server ended unexpectedly"),
+            Self::InvalidWorkingDirectory(path) => {
+                write!(
+                    formatter,
+                    "working directory must be absolute: {}",
+                    path.display()
+                )
+            }
         }
     }
 }
@@ -64,7 +97,10 @@ impl Error for CodexError {
         match self {
             Self::Io(error) => Some(error),
             Self::Json(error) => Some(error),
-            Self::Server { .. } | Self::Protocol(_) | Self::ProcessEnded => None,
+            Self::Server { .. }
+            | Self::Protocol(_)
+            | Self::ProcessEnded
+            | Self::InvalidWorkingDirectory(_) => None,
         }
     }
 }
@@ -86,6 +122,7 @@ pub struct CodexAppServer {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     server_info: CodexServerInfo,
+    next_request_id: u64,
 }
 
 impl CodexAppServer {
@@ -116,6 +153,7 @@ impl CodexAppServer {
                 platform_family: String::new(),
                 platform_os: String::new(),
             },
+            next_request_id: 1,
         };
 
         server.initialize(client_info)?;
@@ -126,23 +164,68 @@ impl CodexAppServer {
         &self.server_info
     }
 
+    pub fn start_thread(
+        &mut self,
+        options: CodexThreadOptions,
+    ) -> Result<AgentSession, CodexError> {
+        options.validate()?;
+
+        let response: ThreadStartResponse = self.request(
+            "thread/start",
+            json!({
+                "cwd": options.cwd,
+                "model": options.model,
+                "ephemeral": options.ephemeral
+            }),
+        )?;
+
+        let session_id = SessionId::new(response.thread.id)
+            .map_err(|error| CodexError::Protocol(error.to_string()))?;
+
+        Ok(AgentSession::new(session_id, AgentKind::Codex))
+    }
+
     fn initialize(&mut self, client_info: CodexClientInfo) -> Result<(), CodexError> {
-        let request = json!({
-            "id": INITIALIZE_REQUEST_ID,
-            "method": "initialize",
-            "params": {
+        self.server_info = self.request(
+            "initialize",
+            json!({
                 "clientInfo": client_info,
                 "capabilities": {}
-            }
-        });
-
-        write_message(&mut self.stdin, &request)?;
-        self.server_info = read_response(&mut self.stdout, INITIALIZE_REQUEST_ID)?;
+            }),
+        )?;
 
         // The notification tells Codex that Uzda is ready to receive normal server events.
         write_message(&mut self.stdin, &json!({ "method": "initialized" }))?;
         Ok(())
     }
+
+    fn request<T: DeserializeOwned>(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> Result<T, CodexError> {
+        let request_id = self.next_request_id;
+        self.next_request_id += 1;
+
+        let request = json!({
+            "id": request_id,
+            "method": method,
+            "params": params
+        });
+
+        write_message(&mut self.stdin, &request)?;
+        read_response(&mut self.stdout, request_id)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ThreadStartResponse {
+    thread: StartedThread,
+}
+
+#[derive(Debug, Deserialize)]
+struct StartedThread {
+    id: String,
 }
 
 impl Drop for CodexAppServer {
@@ -252,6 +335,30 @@ mod tests {
                 code: -1,
                 message
             }) if message == "nope"
+        ));
+    }
+
+    #[test]
+    fn maps_codex_thread_to_core_session() {
+        let response: ThreadStartResponse = serde_json::from_value(json!({
+            "thread": { "id": "thread-123" }
+        }))
+        .expect("the response should be valid");
+        let session_id = SessionId::new(response.thread.id).expect("the ID should be valid");
+        let session = AgentSession::new(session_id, AgentKind::Codex);
+
+        assert_eq!(session.id.as_str(), "thread-123");
+        assert_eq!(session.agent, AgentKind::Codex);
+    }
+
+    #[test]
+    fn rejects_relative_working_directory() {
+        let options = CodexThreadOptions::new("relative/path");
+
+        assert!(matches!(
+            options.validate(),
+            Err(CodexError::InvalidWorkingDirectory(path))
+                if path == std::path::Path::new("relative/path")
         ));
     }
 }
