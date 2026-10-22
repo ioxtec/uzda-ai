@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Write};
@@ -7,7 +8,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use uzda_core::{AgentKind, AgentSession, SessionId};
+use uzda_core::{AgentEvent, AgentKind, AgentSession, SessionId};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -68,6 +69,10 @@ pub enum CodexError {
     Server { code: i64, message: String },
     Protocol(String),
     ProcessEnded,
+    EmptyPrompt,
+    WrongAgent(AgentKind),
+    TurnFailed(String),
+    UnsupportedServerRequest(String),
     InvalidWorkingDirectory(PathBuf),
 }
 
@@ -81,6 +86,14 @@ impl fmt::Display for CodexError {
             }
             Self::Protocol(message) => write!(formatter, "unexpected Codex response: {message}"),
             Self::ProcessEnded => formatter.write_str("Codex app-server ended unexpectedly"),
+            Self::EmptyPrompt => formatter.write_str("prompt cannot be empty"),
+            Self::WrongAgent(agent) => {
+                write!(formatter, "cannot use a {agent} session with Codex")
+            }
+            Self::TurnFailed(message) => write!(formatter, "Codex turn failed: {message}"),
+            Self::UnsupportedServerRequest(method) => {
+                write!(formatter, "Codex requested unsupported action: {method}")
+            }
             Self::InvalidWorkingDirectory(path) => {
                 write!(
                     formatter,
@@ -100,6 +113,10 @@ impl Error for CodexError {
             Self::Server { .. }
             | Self::Protocol(_)
             | Self::ProcessEnded
+            | Self::EmptyPrompt
+            | Self::WrongAgent(_)
+            | Self::TurnFailed(_)
+            | Self::UnsupportedServerRequest(_)
             | Self::InvalidWorkingDirectory(_) => None,
         }
     }
@@ -123,6 +140,7 @@ pub struct CodexAppServer {
     stdout: BufReader<ChildStdout>,
     server_info: CodexServerInfo,
     next_request_id: u64,
+    pending_messages: VecDeque<Value>,
 }
 
 impl CodexAppServer {
@@ -154,6 +172,7 @@ impl CodexAppServer {
                 platform_os: String::new(),
             },
             next_request_id: 1,
+            pending_messages: VecDeque::new(),
         };
 
         server.initialize(client_info)?;
@@ -185,6 +204,84 @@ impl CodexAppServer {
         Ok(AgentSession::new(session_id, AgentKind::Codex))
     }
 
+    pub fn run_turn(
+        &mut self,
+        session: &AgentSession,
+        prompt: &str,
+        mut on_event: impl FnMut(AgentEvent),
+    ) -> Result<(), CodexError> {
+        if session.agent != AgentKind::Codex {
+            return Err(CodexError::WrongAgent(session.agent));
+        }
+
+        if prompt.trim().is_empty() {
+            return Err(CodexError::EmptyPrompt);
+        }
+
+        let response: TurnStartResponse = self.request(
+            "turn/start",
+            json!({
+                "threadId": session.id.as_str(),
+                "input": [{
+                    "type": "text",
+                    "text": prompt
+                }]
+            }),
+        )?;
+        let turn_id = response.turn.id;
+        let mut latest_error = None;
+
+        loop {
+            let message = self.next_message()?;
+
+            if message.get("id").is_some() && message.get("method").is_some() {
+                let method = message["method"].as_str().unwrap_or("unknown").to_owned();
+                return Err(CodexError::UnsupportedServerRequest(method));
+            }
+
+            match message.get("method").and_then(Value::as_str) {
+                Some("item/agentMessage/delta") => {
+                    let event: AgentMessageDelta = parse_params(message)?;
+
+                    if event.matches(session.id.as_str(), &turn_id) {
+                        on_event(AgentEvent::TextDelta(event.delta));
+                    }
+                }
+                Some("error") => {
+                    let event: ErrorNotification = parse_params(message)?;
+
+                    if event.matches(session.id.as_str(), &turn_id) {
+                        latest_error = Some(event.error.message);
+                    }
+                }
+                Some("turn/completed") => {
+                    let event: TurnCompleted = parse_params(message)?;
+
+                    if !event.matches(session.id.as_str(), &turn_id) {
+                        continue;
+                    }
+
+                    if event.turn.status == "completed" {
+                        on_event(AgentEvent::TurnCompleted);
+                        return Ok(());
+                    }
+
+                    let message = event
+                        .turn
+                        .error
+                        .map(|error| error.message)
+                        .or(latest_error)
+                        .unwrap_or_else(|| format!("turn ended with status {}", event.turn.status));
+                    on_event(AgentEvent::TurnFailed {
+                        message: message.clone(),
+                    });
+                    return Err(CodexError::TurnFailed(message));
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn initialize(&mut self, client_info: CodexClientInfo) -> Result<(), CodexError> {
         self.server_info = self.request(
             "initialize",
@@ -214,7 +311,15 @@ impl CodexAppServer {
         });
 
         write_message(&mut self.stdin, &request)?;
-        read_response(&mut self.stdout, request_id)
+        read_response(&mut self.stdout, request_id, &mut self.pending_messages)
+    }
+
+    fn next_message(&mut self) -> Result<Value, CodexError> {
+        if let Some(message) = self.pending_messages.pop_front() {
+            return Ok(message);
+        }
+
+        read_message(&mut self.stdout)
     }
 }
 
@@ -228,9 +333,69 @@ struct StartedThread {
     id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct TurnStartResponse {
+    turn: Turn,
+}
+
+#[derive(Debug, Deserialize)]
+struct Turn {
+    id: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    error: Option<TurnError>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentMessageDelta {
+    delta: String,
+    thread_id: String,
+    turn_id: String,
+}
+
+impl AgentMessageDelta {
+    fn matches(&self, thread_id: &str, turn_id: &str) -> bool {
+        self.thread_id == thread_id && self.turn_id == turn_id
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnCompleted {
+    thread_id: String,
+    turn: Turn,
+}
+
+impl TurnCompleted {
+    fn matches(&self, thread_id: &str, turn_id: &str) -> bool {
+        self.thread_id == thread_id && self.turn.id == turn_id
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ErrorNotification {
+    error: TurnError,
+    thread_id: String,
+    turn_id: String,
+}
+
+impl ErrorNotification {
+    fn matches(&self, thread_id: &str, turn_id: &str) -> bool {
+        self.thread_id == thread_id && self.turn_id == turn_id
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TurnError {
+    message: String,
+}
+
 impl Drop for CodexAppServer {
     fn drop(&mut self) {
-        // There is no conversation to preserve yet, so a direct shutdown keeps this first client simple.
+        // Threads live in Codex, so stopping this transport does not discard their history.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -246,21 +411,14 @@ fn write_message(writer: &mut impl Write, message: &Value) -> Result<(), CodexEr
 fn read_response<T: DeserializeOwned>(
     reader: &mut impl BufRead,
     request_id: u64,
+    pending_messages: &mut VecDeque<Value>,
 ) -> Result<T, CodexError> {
-    let mut line = String::new();
-
     loop {
-        line.clear();
+        let message = read_message(reader)?;
 
-        if reader.read_line(&mut line)? == 0 {
-            return Err(CodexError::ProcessEnded);
-        }
-
-        let message: Value = serde_json::from_str(&line)?;
-
-        // Notifications may arrive while a request is in flight. They belong to the event loop,
-        // but for now we simply keep reading until our matching response appears.
+        // Codex can start streaming before it acknowledges the request. Keep those early events.
         if message.get("id").and_then(Value::as_u64) != Some(request_id) {
+            pending_messages.push_back(message);
             continue;
         }
 
@@ -275,6 +433,25 @@ fn read_response<T: DeserializeOwned>(
 
         return serde_json::from_value(result).map_err(CodexError::from);
     }
+}
+
+fn read_message(reader: &mut impl BufRead) -> Result<Value, CodexError> {
+    let mut line = String::new();
+
+    if reader.read_line(&mut line)? == 0 {
+        return Err(CodexError::ProcessEnded);
+    }
+
+    serde_json::from_str(&line).map_err(CodexError::from)
+}
+
+fn parse_params<T: DeserializeOwned>(message: Value) -> Result<T, CodexError> {
+    let params = message
+        .get("params")
+        .cloned()
+        .ok_or_else(|| CodexError::Protocol("notification has no params".to_owned()))?;
+
+    serde_json::from_value(params).map_err(CodexError::from)
 }
 
 fn server_error(error: &Value) -> CodexError {
@@ -315,19 +492,23 @@ mod tests {
             "\"platformOs\":\"macos\"}}\n"
         );
         let mut input = Cursor::new(messages);
+        let mut pending_messages = VecDeque::new();
 
-        let response: CodexServerInfo =
-            read_response(&mut input, 1).expect("the matching response should be parsed");
+        let response: CodexServerInfo = read_response(&mut input, 1, &mut pending_messages)
+            .expect("the matching response should be parsed");
 
         assert_eq!(response.user_agent, "Codex test");
         assert_eq!(response.platform_os, "macos");
+        assert_eq!(pending_messages.len(), 1);
+        assert_eq!(pending_messages[0]["method"], "account/updated");
     }
 
     #[test]
     fn returns_server_error() {
         let mut input = Cursor::new("{\"id\":1,\"error\":{\"code\":-1,\"message\":\"nope\"}}\n");
+        let mut pending_messages = VecDeque::new();
 
-        let result = read_response::<CodexServerInfo>(&mut input, 1);
+        let result = read_response::<CodexServerInfo>(&mut input, 1, &mut pending_messages);
 
         assert!(matches!(
             result,
@@ -360,5 +541,43 @@ mod tests {
             Err(CodexError::InvalidWorkingDirectory(path))
                 if path == std::path::Path::new("relative/path")
         ));
+    }
+
+    #[test]
+    fn parses_agent_message_delta() {
+        let message = json!({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "delta": "Hello",
+                "itemId": "item-1",
+                "threadId": "thread-1",
+                "turnId": "turn-1"
+            }
+        });
+
+        let event: AgentMessageDelta = parse_params(message).expect("the event should be valid");
+
+        assert_eq!(event.delta, "Hello");
+        assert!(event.matches("thread-1", "turn-1"));
+    }
+
+    #[test]
+    fn recognizes_successful_turn_completion() {
+        let message = json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {
+                    "id": "turn-1",
+                    "items": [],
+                    "status": "completed"
+                }
+            }
+        });
+
+        let event: TurnCompleted = parse_params(message).expect("the event should be valid");
+
+        assert_eq!(event.turn.status, "completed");
+        assert!(event.matches("thread-1", "turn-1"));
     }
 }

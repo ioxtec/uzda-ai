@@ -1,9 +1,10 @@
 use std::env;
+use std::io::{self, Write};
 use std::process::ExitCode;
 
 use uzda_agent_claude::ClaudeAgent;
 use uzda_agent_codex::{CodexAgent, CodexError, CodexThreadOptions};
-use uzda_core::{AgentRuntime, RuntimeAvailability};
+use uzda_core::{AgentEvent, AgentRuntime, RuntimeAvailability};
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = env::args().skip(1).collect();
@@ -39,6 +40,15 @@ fn main() -> ExitCode {
                 }
             }
         }
+        [command, action, prompt @ ..] if command == "codex" && action == "ask" => {
+            match ask_codex(&prompt.join(" ")) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("Could not complete the Codex turn: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         _ => {
             eprintln!("Unknown command: {}\n", arguments.join(" "));
             print_help();
@@ -54,6 +64,7 @@ fn print_help() {
     println!("    uzda agents          Show local agent runtimes");
     println!("    uzda codex status    Test the Codex app-server connection");
     println!("    uzda codex start     Start a Codex thread in this directory");
+    println!("    uzda codex ask TEXT  Ask Codex and stream its answer");
     println!("    uzda help            Show this help");
 }
 
@@ -97,6 +108,22 @@ fn start_codex_thread() -> Result<(), CodexError> {
     println!("    Session ID: {}", session.id.as_str());
 
     Ok(())
+}
+
+fn ask_codex(prompt: &str) -> Result<(), CodexError> {
+    let agent = CodexAgent::default();
+    let mut server = agent.connect()?;
+    let options = CodexThreadOptions::new(env::current_dir()?);
+    let session = server.start_thread(options)?;
+
+    server.run_turn(&session, prompt, |event| match event {
+        AgentEvent::TextDelta(text) => {
+            print!("{text}");
+            let _ = io::stdout().flush();
+        }
+        AgentEvent::TurnCompleted => println!(),
+        _ => {}
+    })
 }
 
 fn format_availability(availability: RuntimeAvailability) -> String {
