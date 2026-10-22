@@ -1,0 +1,8 @@
+[package]
+name = "uzda-agent-claude"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+uzda-core = { path = "../uzda-core" }
