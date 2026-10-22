@@ -189,7 +189,7 @@ impl CodexAppServer {
     ) -> Result<AgentSession, CodexError> {
         options.validate()?;
 
-        let response: ThreadStartResponse = self.request(
+        let response: ThreadResponse = self.request(
             "thread/start",
             json!({
                 "cwd": options.cwd,
@@ -202,6 +202,20 @@ impl CodexAppServer {
             .map_err(|error| CodexError::Protocol(error.to_string()))?;
 
         Ok(AgentSession::new(session_id, AgentKind::Codex))
+    }
+
+    pub fn resume_thread(&mut self, session_id: &SessionId) -> Result<AgentSession, CodexError> {
+        let response: ThreadResponse = self.request(
+            "thread/resume",
+            json!({
+                "threadId": session_id.as_str(),
+                "excludeTurns": true
+            }),
+        )?;
+        let resumed_id = SessionId::new(response.thread.id)
+            .map_err(|error| CodexError::Protocol(error.to_string()))?;
+
+        Ok(AgentSession::new(resumed_id, AgentKind::Codex))
     }
 
     pub fn run_turn(
@@ -324,7 +338,7 @@ impl CodexAppServer {
 }
 
 #[derive(Debug, Deserialize)]
-struct ThreadStartResponse {
+struct ThreadResponse {
     thread: StartedThread,
 }
 
@@ -521,7 +535,7 @@ mod tests {
 
     #[test]
     fn maps_codex_thread_to_core_session() {
-        let response: ThreadStartResponse = serde_json::from_value(json!({
+        let response: ThreadResponse = serde_json::from_value(json!({
             "thread": { "id": "thread-123" }
         }))
         .expect("the response should be valid");
@@ -530,6 +544,22 @@ mod tests {
 
         assert_eq!(session.id.as_str(), "thread-123");
         assert_eq!(session.agent, AgentKind::Codex);
+    }
+
+    #[test]
+    fn maps_resumed_thread_to_core_session() {
+        let response: ThreadResponse = serde_json::from_value(json!({
+            "thread": {
+                "id": "thread-123",
+                "turns": []
+            },
+            "model": "test-model"
+        }))
+        .expect("the response should be valid");
+        let session_id = SessionId::new(response.thread.id).expect("the ID should be valid");
+        let session = AgentSession::new(session_id, AgentKind::Codex);
+
+        assert_eq!(session.id.as_str(), "thread-123");
     }
 
     #[test]

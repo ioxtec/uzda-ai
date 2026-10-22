@@ -1,10 +1,15 @@
 use std::env;
+use std::error::Error;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
 use uzda_agent_claude::ClaudeAgent;
-use uzda_agent_codex::{CodexAgent, CodexError, CodexThreadOptions};
-use uzda_core::{AgentEvent, AgentRuntime, RuntimeAvailability};
+use uzda_agent_codex::{CodexAgent, CodexAppServer, CodexError, CodexThreadOptions};
+use uzda_core::{
+    AgentEvent, AgentKind, AgentRuntime, AgentSession, LocalSessionStore, RuntimeAvailability,
+};
+
+type CliResult<T = ()> = Result<T, Box<dyn Error>>;
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = env::args().skip(1).collect();
@@ -98,23 +103,28 @@ fn print_codex_status() -> Result<(), CodexError> {
     Ok(())
 }
 
-fn start_codex_thread() -> Result<(), CodexError> {
+fn start_codex_thread() -> CliResult {
     let agent = CodexAgent::default();
     let mut server = agent.connect()?;
-    let options = CodexThreadOptions::new(env::current_dir()?);
+    let project_directory = env::current_dir()?;
+    let options = CodexThreadOptions::new(&project_directory);
     let session = server.start_thread(options)?;
+    let store = LocalSessionStore::for_project(project_directory);
+    store.save(&session)?;
 
     println!("Started Codex thread");
     println!("    Session ID: {}", session.id.as_str());
+    println!("    Saved in:   {}", store.path().display());
 
     Ok(())
 }
 
-fn ask_codex(prompt: &str) -> Result<(), CodexError> {
+fn ask_codex(prompt: &str) -> CliResult {
     let agent = CodexAgent::default();
     let mut server = agent.connect()?;
-    let options = CodexThreadOptions::new(env::current_dir()?);
-    let session = server.start_thread(options)?;
+    let project_directory = env::current_dir()?;
+    let store = LocalSessionStore::for_project(&project_directory);
+    let session = open_codex_session(&mut server, &store, &project_directory)?;
 
     server.run_turn(&session, prompt, |event| match event {
         AgentEvent::TextDelta(text) => {
@@ -123,7 +133,24 @@ fn ask_codex(prompt: &str) -> Result<(), CodexError> {
         }
         AgentEvent::TurnCompleted => println!(),
         _ => {}
-    })
+    })?;
+
+    Ok(())
+}
+
+fn open_codex_session(
+    server: &mut CodexAppServer,
+    store: &LocalSessionStore,
+    project_directory: &std::path::Path,
+) -> CliResult<AgentSession> {
+    if let Some(saved) = store.load(AgentKind::Codex)? {
+        return Ok(server.resume_thread(&saved.id)?);
+    }
+
+    let session = server.start_thread(CodexThreadOptions::new(project_directory))?;
+    store.save(&session)?;
+
+    Ok(session)
 }
 
 fn format_availability(availability: RuntimeAvailability) -> String {

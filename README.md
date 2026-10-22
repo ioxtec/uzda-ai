@@ -29,17 +29,19 @@ Test the first real Codex app-server handshake:
 cargo run -p uzda-cli -- codex status
 ```
 
-Start a persistent Codex thread for the current directory:
+Start a fresh Codex thread for the current directory and remember it locally:
 
 ```sh
 cargo run -p uzda-cli -- codex start
 ```
 
-Start a new thread, send a prompt, and stream the answer:
+Resume the remembered thread, send a prompt, and stream the answer. The first use creates a thread automatically:
 
 ```sh
 cargo run -p uzda-cli -- codex ask "Explain ownership in one sentence"
 ```
+
+Uzda stores only local session identifiers in `.uzda/sessions.json`. Credentials remain managed by the installed agent runtime and are never copied into the project.
 
 ## Check
 
