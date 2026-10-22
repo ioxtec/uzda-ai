@@ -45,6 +45,14 @@ Uzda stores only local session identifiers in `.uzda/sessions.json`. Credentials
 
 Tool activity is printed while a turn is running. If Codex asks for permission to run a command or change files, the CLI requires an explicit `y` or `yes`; pressing Enter declines the request.
 
+Ask Claude through the same event stream. The first successful turn saves its session ID, and later turns resume it:
+
+```sh
+cargo run -p uzda-cli -- claude ask "Explain borrowing in one sentence"
+```
+
+The Claude Code CLI must be installed and authenticated separately. In this first non-interactive adapter, permission prompts are declined instead of bypassed.
+
 ## Check
 
 ```sh

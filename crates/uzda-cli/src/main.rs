@@ -55,6 +55,15 @@ fn main() -> ExitCode {
                 }
             }
         }
+        [command, action, prompt @ ..] if command == "claude" && action == "ask" => {
+            match ask_claude(&prompt.join(" ")) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("Could not complete the Claude turn: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         _ => {
             eprintln!("Unknown command: {}\n", arguments.join(" "));
             print_help();
@@ -71,6 +80,7 @@ fn print_help() {
     println!("    uzda codex status    Test the Codex app-server connection");
     println!("    uzda codex start     Start a Codex thread in this directory");
     println!("    uzda codex ask TEXT  Ask Codex and stream its answer");
+    println!("    uzda claude ask TEXT Ask Claude and stream its answer");
     println!("    uzda help            Show this help");
 }
 
@@ -127,27 +137,23 @@ fn ask_codex(prompt: &str) -> CliResult {
     let store = LocalSessionStore::for_project(&project_directory);
     let session = open_codex_session(&mut server, &store, &project_directory)?;
 
-    server.run_turn(
-        &session,
+    server.run_turn(&session, prompt, print_agent_event, ask_for_approval)?;
+
+    Ok(())
+}
+
+fn ask_claude(prompt: &str) -> CliResult {
+    let agent = ClaudeAgent::default();
+    let project_directory = env::current_dir()?;
+    let store = LocalSessionStore::for_project(&project_directory);
+    let saved = store.load(AgentKind::Claude)?;
+    let session = agent.run_turn(
+        saved.as_ref(),
+        &project_directory,
         prompt,
-        |event| match event {
-            AgentEvent::TextDelta(text) => {
-                print!("{text}");
-                let _ = io::stdout().flush();
-            }
-            AgentEvent::ToolStarted { name } => eprintln!("[tool started] {name}"),
-            AgentEvent::ToolCompleted { name, succeeded } => {
-                let status = if succeeded { "completed" } else { "failed" };
-                eprintln!("[tool {status}] {name}");
-            }
-            AgentEvent::ApprovalRequired { description } => {
-                eprintln!("\nApproval required:\n{description}");
-            }
-            AgentEvent::TurnCompleted => println!(),
-            AgentEvent::TurnFailed { .. } => {}
-        },
-        ask_for_approval,
+        print_agent_event,
     )?;
+    store.save(&session)?;
 
     Ok(())
 }
@@ -177,6 +183,25 @@ fn ask_for_approval(_description: &str) -> ApprovalDecision {
             ApprovalDecision::Approve
         }
         _ => ApprovalDecision::Decline,
+    }
+}
+
+fn print_agent_event(event: AgentEvent) {
+    match event {
+        AgentEvent::TextDelta(text) => {
+            print!("{text}");
+            let _ = io::stdout().flush();
+        }
+        AgentEvent::ToolStarted { name } => eprintln!("[tool started] {name}"),
+        AgentEvent::ToolCompleted { name, succeeded } => {
+            let status = if succeeded { "completed" } else { "failed" };
+            eprintln!("[tool {status}] {name}");
+        }
+        AgentEvent::ApprovalRequired { description } => {
+            eprintln!("\nApproval required:\n{description}");
+        }
+        AgentEvent::TurnCompleted => println!(),
+        AgentEvent::TurnFailed { message } => eprintln!("\nTurn failed: {message}"),
     }
 }
 

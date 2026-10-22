@@ -1,7 +1,15 @@
+mod runner;
+
 use std::io::ErrorKind;
+use std::path::Path;
 use std::process::Command;
 
-use uzda_core::{AgentCapabilities, AgentDescriptor, AgentKind, AgentRuntime, RuntimeAvailability};
+use uzda_core::{
+    AgentCapabilities, AgentDescriptor, AgentEvent, AgentKind, AgentRuntime, AgentSession,
+    RuntimeAvailability,
+};
+
+pub use runner::ClaudeError;
 
 #[derive(Debug, Clone)]
 pub struct ClaudeAgent {
@@ -13,6 +21,16 @@ impl ClaudeAgent {
         Self {
             command: command.into(),
         }
+    }
+
+    pub fn run_turn(
+        &self,
+        session: Option<&AgentSession>,
+        cwd: &Path,
+        prompt: &str,
+        on_event: impl FnMut(AgentEvent),
+    ) -> Result<AgentSession, ClaudeError> {
+        runner::run_turn(&self.command, session, cwd, prompt, on_event)
     }
 }
 
@@ -26,7 +44,7 @@ impl AgentRuntime for ClaudeAgent {
     fn descriptor(&self) -> AgentDescriptor {
         AgentDescriptor {
             kind: AgentKind::Claude,
-            display_name: "Claude Code",
+            display_name: "Claude",
             capabilities: AgentCapabilities::coding_agent(),
         }
     }
@@ -67,7 +85,7 @@ mod tests {
         let descriptor = ClaudeAgent::default().descriptor();
 
         assert_eq!(descriptor.kind, AgentKind::Claude);
-        assert_eq!(descriptor.display_name, "Claude Code");
+        assert_eq!(descriptor.display_name, "Claude");
     }
 
     #[test]
